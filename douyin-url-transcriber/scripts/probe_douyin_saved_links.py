@@ -22,6 +22,7 @@ MAX_FOLLOWERS = 10_000
 WITHIN_DAYS = 180
 MAX_CARDS = 8
 SCROLL_PAGES = 3
+MAX_SAVED = 20
 KEYWORD_DELAY = "20,45"
 ACTION_DELAY = "3,8"
 DETAIL_DELAY = "8,15"
@@ -42,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--within-days", type=int, default=WITHIN_DAYS)
     parser.add_argument("--max-cards", type=int, default=MAX_CARDS)
     parser.add_argument("--scroll-pages", type=int, default=SCROLL_PAGES)
-    parser.add_argument("--max-saved", type=int, default=0, help="Stop after saving this many validated records. 0 means no cap.")
+    parser.add_argument("--max-saved", type=int, default=MAX_SAVED, help="Stop after saving this many validated records. Use 0 for no cap.")
     parser.add_argument("--keyword-delay", default=KEYWORD_DELAY, help="Random delay range in seconds between keywords, e.g. 20,45.")
     parser.add_argument("--action-delay", default=ACTION_DELAY, help="Random delay range in seconds between scroll/click actions.")
     parser.add_argument("--detail-delay", default=DETAIL_DELAY, help="Random delay range in seconds before/after opening detail pages.")
@@ -177,6 +178,21 @@ def has_verification_challenge(frame_urls: list[str]) -> bool:
     return any("verifycenter/captcha" in url or "verify.zijieapi.com" in url for url in frame_urls)
 
 
+def response_has_verify_check(text: str) -> bool:
+    lowered = (text or "").lower()
+    return "verify_check" in lowered and ("search_nil_type" in lowered or "verify" in lowered)
+
+
+def should_inspect_verification_response(url: str, content_type: str) -> bool:
+    lowered_url = (url or "").lower()
+    lowered_type = (content_type or "").lower()
+    if not any(host in lowered_url for host in ("douyin.com", "douyinpic.com", "douyinstatic.com")):
+        return False
+    if lowered_type and not any(kind in lowered_type for kind in ("json", "text", "javascript")):
+        return False
+    return "search" in lowered_url or "aweme" in lowered_url or "general" in lowered_url
+
+
 def parse_keywords_file(path: Path) -> list[dict[str, object]]:
     if not path.exists():
         raise FileNotFoundError(f"Keywords file does not exist: {path}")
@@ -231,9 +247,17 @@ def dated_output_dir(base: Path) -> Path:
     return base / today_local().strftime("%Y%m%d")
 
 
-async def wait_results(page) -> bool:
+def is_response_verification_blocked(verification_state: dict[str, object] | None) -> bool:
+    return bool(verification_state and verification_state.get("blocked"))
+
+
+async def is_platform_verification_blocked(page, verification_state: dict[str, object] | None = None) -> bool:
+    return is_response_verification_blocked(verification_state) or await is_verification_blocked(page)
+
+
+async def wait_results(page, verification_state: dict[str, object] | None = None) -> bool:
     for _ in range(35):
-        if await is_verification_blocked(page):
+        if await is_platform_verification_blocked(page, verification_state):
             return False
         text = await page.evaluate("() => document.body?.innerText || ''")
         if "为你找到以下结果" in text or "问问AI" in text:
@@ -502,6 +526,13 @@ async def main() -> int:
         "blocked": False,
         "blocked_at_keyword_index": None,
         "blocked_at_keyword": "",
+        "blocked_reason": "",
+        "blocked_source_url": "",
+    }
+    verification_state: dict[str, object] = {
+        "blocked": False,
+        "reason": "",
+        "source_url": "",
     }
 
     def refresh_run_info() -> None:
@@ -513,6 +544,23 @@ async def main() -> int:
         context = browser.contexts[0]
         page = await context.new_page()
 
+        async def inspect_verification_response(response) -> None:
+            if verification_state["blocked"]:
+                return
+            try:
+                content_type = response.headers.get("content-type", "")
+                if not should_inspect_verification_response(response.url, content_type):
+                    return
+                text = await response.text()
+            except Exception:
+                return
+            if response_has_verify_check(text):
+                verification_state["blocked"] = True
+                verification_state["reason"] = "search_api_verify_check"
+                verification_state["source_url"] = response.url
+
+        page.on("response", lambda response: asyncio.create_task(inspect_verification_response(response)))
+
         for keyword_index, selection in enumerate(selections, 1):
             if args.max_saved and len(all_records) >= args.max_saved:
                 break
@@ -522,19 +570,21 @@ async def main() -> int:
             source_url = build_search_url(keyword)
             print(f"[INFO] Keyword {keyword_index}/{len(selections)}: {keyword}", flush=True)
             await page.goto(source_url, wait_until="domcontentloaded", timeout=60000)
-            await wait_results(page)
-            if await is_verification_blocked(page):
+            await wait_results(page, verification_state)
+            if await is_platform_verification_blocked(page, verification_state):
                 refresh_run_info()
                 run_info["blocked"] = True
                 run_info["blocked_at_keyword_index"] = keyword_index
                 run_info["blocked_at_keyword"] = keyword
+                run_info["blocked_reason"] = str(verification_state.get("reason") or "platform_verification_required")
+                run_info["blocked_source_url"] = str(verification_state.get("source_url") or page.url)
                 skipped.append(
                     {
                         "keyword": keyword,
                         "keyword_index": keyword_index,
-                        "reason": "platform_verification_required",
+                        "reason": run_info["blocked_reason"],
                         "elapsed_seconds": run_info["elapsed_seconds"],
-                        "url": page.url,
+                        "url": run_info["blocked_source_url"],
                     }
                 )
                 keyword_stats.append({"keyword": keyword, "cards_seen": 0, "chosen": 0, "blocked": True})

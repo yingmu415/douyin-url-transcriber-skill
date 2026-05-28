@@ -37,6 +37,7 @@ Default filters:
 - `--within-days 180`
 - `--min-likes 100`
 - `--max-followers 10000`
+- `--max-saved 20`
 
 Example:
 
@@ -81,6 +82,7 @@ Important implementation detail: do not rely on `yt-dlp` Douyin extractor alone.
 ## Verification And Safety
 
 - If Douyin verification/captcha appears, stop the run, save progress, and ask the user to solve it manually in the logged-in Chrome window.
+- Also stop and save progress if Douyin search API responses contain `verify_check`, even when no visible captcha iframe is shown yet.
 - Use low-risk collection parameters for broader runs: small keyword batches, shallow scroll depth, and random delays.
 - Before claiming completion, run at least:
 
