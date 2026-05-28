@@ -1,0 +1,4 @@
+interface:
+  display_name: "Douyin URL Transcriber"
+  short_description: "Collect Douyin URLs and transcribe videos with faster-whisper"
+  default_prompt: "Collect Douyin video URLs from logged-in web search, then download and transcribe them locally with faster-whisper."
